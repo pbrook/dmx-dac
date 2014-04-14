@@ -4,6 +4,8 @@
  
 #include <avr/sleep.h>
 #include <avr/wdt.h>
+#include <TimerOne.h>
+#include <Wire.h>
 #include "dmx-dac.h"
 
 /* DAC module connector pinout (pin1 to middle of board):
@@ -19,8 +21,10 @@
 static const uint8_t load_pin[NUM_DACS] = {A0, A1, A2, 9, 7, 8};
 // Additional unuised chip selects on A3, 6
 
+#define IO_RST_PIN 4
+
 #define MAX_CHANNELS (NUM_DACS * 8)
-int first_channel;
+int first_dmx_channel;
 int frame_bytes = -1;
 volatile uint8_t channel_value[MAX_CHANNELS];
 volatile uint8_t channel_changed[NUM_DACS];
@@ -72,8 +76,10 @@ restart_dac(void)
 
   changed = false;
   for (dac = 0; dac < NUM_DACS; dac++) {
-      if (channel_changed[dac])
-	changed = true;
+      if (channel_changed[dac]) {
+	  changed = true;
+	  break;
+      }
   }
   if (!changed)
     return;
@@ -98,10 +104,27 @@ ISR(SPI_STC_vect)
   }
 }
 
+static void
+timer_tick(void)
+{
+  static int count;
+  uint8_t dac;
+  if (count > 0) {
+      count--;
+      return;
+  }
+  count = 1000;
+  for (dac = 0; dac < NUM_DACS; dac++)
+    channel_changed[dac] = 0xffu;
+
+  if (!dac_active)
+    restart_dac();
+}
+
 void
 dmx_set_channel(int channel, uint8_t val)
 {
-  channel -= first_channel;
+  channel -= first_dmx_channel;
   if (channel < 0 || channel >= MAX_CHANNELS)
     return;
   if (channel_value[channel] != val) {
@@ -145,6 +168,7 @@ setup_uart(void)
 #error unsupported CPU speed
 #endif
   UCSR1B = _BV(RXCIE1) | _BV(RXEN1);
+  pinMode(0, INPUT_PULLUP);
 }
 
 static void
@@ -153,6 +177,7 @@ dac_init(void)
   int i;
 
   for (i = 0; i < NUM_DACS; i++) {
+      digitalWrite(load_pin[i], 1);
       pinMode(load_pin[i], OUTPUT);
       digitalWrite(load_pin[i], 1);
       channel_value[i] = 0;
@@ -172,13 +197,73 @@ watchdog_init(void)
   wdt_enable(WDTO_1S);
 }
 
+static void
+timer_init(void)
+{
+  Timer1.initialize(1000);
+  Timer1.attachInterrupt(timer_tick);
+}
+
+#define MCP23_I2C_ADDR 0x20
+
+#define MCP23_IODIRA 0x00
+#define MCP23_IODIRB 0x01
+#define MCP23_IOPOLA 0x02
+#define MCP23_IOPOLB 0x03
+#define MCP23_GPPUA 0x0c
+#define MCP23_GPPUB 0x0d
+#define MCP23_GPIOA 0x12
+#define MCP23_GPIOB 0x13
+#define MCP23_IOLATA 0x14
+#define MCP23_IOLATB 0x15
+
+static void
+ioex_write(uint8_t addr, uint8_t data)
+{
+  Wire.beginTransmission(MCP23_I2C_ADDR);
+  Wire.write(addr);
+  Wire.write(data);
+  Wire.endTransmission(true);
+}
+
+static uint8_t
+ioex_read(uint8_t addr)
+{
+  Wire.beginTransmission(MCP23_I2C_ADDR);
+  Wire.write(addr);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MCP23_I2C_ADDR, 1, true);
+  return Wire.read();
+}
+
+static void
+config(void)
+{
+  Wire.begin();
+  pinMode(IO_RST_PIN, OUTPUT);
+  digitalWrite(IO_RST_PIN, 0);
+  delayMicroseconds(1);
+  digitalWrite(IO_RST_PIN, 1);
+  delayMicroseconds(1);
+  ioex_write(MCP23_GPPUA, 0xff);
+  ioex_write(MCP23_GPPUB, 0xff);
+  ioex_write(MCP23_IOPOLA, 0xff);
+  ioex_write(MCP23_IOPOLB, 0xff);
+  // Give inputs chance to stabilize
+  delay(1);
+  first_dmx_channel = ioex_read(MCP23_GPIOA);
+  first_dmx_channel |= (uint16_t)(ioex_read(MCP23_GPIOB) & 1) << 8;
+}
+
 int main(void)
 {
   watchdog_init();
   init();
+  config();
   setup_uart();
   dac_init();
   usb_init();
+  timer_init();
 
   sei();
   set_sleep_mode(SLEEP_MODE_IDLE);

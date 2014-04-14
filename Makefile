@@ -1,5 +1,5 @@
 
-ARDUINO_LIBS = SPI
+ARDUINO_LIBS = TimerOne Wire
 ARDUINO_PORT = /dev/ttyACM0
 
 ifeq (1, 1)
